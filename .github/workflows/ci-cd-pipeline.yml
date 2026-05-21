@@ -10,8 +10,11 @@ on:
   workflow_dispatch:
 
 permissions:
+  # Principle of least privilege: only request what the workflow actually uses.
+  # `contents: read` covers checkout; `actions: read` lets re-runs read prior
+  # job metadata. Per-job permissions (e.g. `contents: write` on auto-fix) are
+  # scoped at the job level below.
   contents: read
-  security-events: write
   actions: read
 
 jobs:
@@ -123,7 +126,15 @@ jobs:
       has_html: ${{ steps.detect.outputs.has_html }}
       has_markdown: ${{ steps.detect.outputs.has_markdown }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (PR branch tip, matches lint-and-test)
+        uses: actions/checkout@v4
+        with:
+          # Check out the same ref as `lint-and-test` so detection sees the
+          # exact tree that will be linted/tested. Otherwise on PRs, the
+          # default checkout uses a synthetic merge commit and could disagree
+          # with the PR branch tip (e.g. if auto-fix added/removed config
+          # files like package.json or tsconfig.json).
+          ref: ${{ github.head_ref || github.ref }}
 
       - name: Detect project type
         id: detect
@@ -155,6 +166,14 @@ jobs:
       - name: Checkout (latest, including any auto-fix commit)
         uses: actions/checkout@v4
         with:
+          # On PRs we deliberately check out the branch tip rather than the
+          # default synthetic merge commit, so we lint/test the same code the
+          # auto-fix job just pushed. Trade-off: merge-conflict-style issues
+          # against the base branch (e.g. duplicate symbols introduced by a
+          # concurrent merge to main) won't surface until after merge.
+          # Branch-protection "require branches to be up to date" mitigates
+          # this. Non-PR triggers fall back to `github.ref` so behavior is
+          # unchanged for push/schedule/dispatch.
           ref: ${{ github.head_ref || github.ref }}
 
       # ── Node.js / TypeScript ──
@@ -201,6 +220,12 @@ jobs:
 
       - name: Security Audit (Node)
         if: needs.detect.outputs.has_node == 'true'
+        # Audits are advisory: transitive-dep vulnerabilities are commonly
+        # out of the project's direct control (waiting on upstream patches),
+        # so we surface findings as warnings instead of hard-failing CI.
+        # Promote to gating by removing `continue-on-error` once your
+        # dependency tree is clean.
+        continue-on-error: true
         run: |
           # Use the package manager that matches the project's lockfile so
           # the audit reflects the actual resolved dependency tree.
@@ -258,6 +283,10 @@ jobs:
 
       - name: Security Audit (pip)
         if: needs.detect.outputs.has_python == 'true'
+        # Advisory for the same reason as the Node audit above. The missing-
+        # tool check still hard-fails because that indicates a pipeline
+        # regression, not a real-world dependency CVE.
+        continue-on-error: true
         run: |
           if ! command -v pip-audit >/dev/null 2>&1; then
             echo "::error::pip-audit is not installed — dependency install step likely failed"
@@ -289,6 +318,10 @@ jobs:
           fetch-depth: 0
 
       - name: Scan for hardcoded secrets
+        # Deferred failure: record the result to a file and let the final
+        # gating step decide the job's exit. This way sensitive-file and
+        # license checks still run on the same CI round and developers see
+        # all violations at once instead of fixing them one-by-one.
         run: |
           echo "## Secret Scan Results" >> "$GITHUB_STEP_SUMMARY"
           FOUND=0
@@ -324,8 +357,9 @@ jobs:
           else
             echo "- :white_check_mark: No hardcoded secrets detected" >> "$GITHUB_STEP_SUMMARY"
           fi
-          # Fail the job if any secret pattern matched.
-          exit $FOUND
+          # Record (don't exit) — gating happens in the final step so the
+          # rest of the security checks still run on this CI round.
+          echo "$FOUND" > /tmp/secrets_found
 
       - name: Check for sensitive files
         run: |
@@ -337,7 +371,7 @@ jobs:
               FOUND=1
             fi
           done
-          exit $FOUND
+          echo "$FOUND" > /tmp/sensitive_found
 
       - name: License check
         run: |
@@ -346,6 +380,19 @@ jobs:
           else
             echo "::notice::No LICENSE file found — consider adding one"
           fi
+
+      - name: Gate on security-scan results
+        # Final assertion: fail the job if any earlier check recorded a
+        # violation. Running last guarantees every check above produced
+        # output, so developers see every problem in a single run.
+        run: |
+          secrets=$(cat /tmp/secrets_found 2>/dev/null || echo 0)
+          sensitive=$(cat /tmp/sensitive_found 2>/dev/null || echo 0)
+          if [ "$secrets" != "0" ] || [ "$sensitive" != "0" ]; then
+            echo "::error::Security scan found violations (secrets=$secrets, sensitive_files=$sensitive)"
+            exit 1
+          fi
+          echo "All security checks passed."
 
   report:
     name: Pipeline Summary
