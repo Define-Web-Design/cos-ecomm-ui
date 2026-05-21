@@ -10,11 +10,112 @@ on:
   workflow_dispatch:
 
 permissions:
+  # Principle of least privilege: only request what the workflow actually uses.
+  # `contents: read` covers checkout; `actions: read` lets re-runs read prior
+  # job metadata. Per-job permissions (e.g. `contents: write` on auto-fix) are
+  # scoped at the job level below.
   contents: read
-  security-events: write
   actions: read
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Self-healing auto-fix job.
+  #
+  # On pull requests from the same repository (forks can't get write
+  # tokens) this job runs the language's auto-fixers and pushes the
+  # resulting commit back to the PR branch BEFORE the gating
+  # lint-and-test job runs. That way, anything mechanically fixable
+  # (formatting, simple lint rules, import order) is healed in place
+  # instead of failing CI.
+  # ─────────────────────────────────────────────────────────────────────
+  auto-fix:
+    name: Auto-fix (self-heal)
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Node dependencies (with retry)
+        if: hashFiles('package.json') != ''
+        run: |
+          # Retry transient network failures up to 3 times.
+          install_cmd() {
+            if   [ -f "package-lock.json" ]; then npm ci
+            elif [ -f "yarn.lock" ];          then yarn install --frozen-lockfile
+            elif [ -f "pnpm-lock.yaml" ];     then npm i -g pnpm && pnpm install --frozen-lockfile
+            else                                   npm install
+            fi
+          }
+          n=0
+          until install_cmd; do
+            n=$((n+1))
+            if [ $n -ge 3 ]; then
+              echo "::error::npm install failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::install failed, retrying ($n/3)…"
+            sleep $((n*5))
+          done
+
+      - name: Auto-fix Node (eslint --fix, prettier --write)
+        if: hashFiles('package.json') != ''
+        run: |
+          # Best-effort: only run if the script/binary exists. Never fail
+          # the auto-fix job for missing tools — gating happens later.
+          if npm run | grep -qE '^\s*lint:fix'; then
+            npm run lint:fix || true
+          elif npx --no-install eslint --version >/dev/null 2>&1; then
+            npx --no-install eslint . --fix || true
+          fi
+          if npm run | grep -qE '^\s*format'; then
+            npm run format || true
+          elif npx --no-install prettier --version >/dev/null 2>&1; then
+            npx --no-install prettier --write . || true
+          fi
+
+      - name: Setup Python
+        if: hashFiles('pyproject.toml', 'requirements.txt', 'setup.py', 'Pipfile') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Auto-fix Python (ruff --fix, ruff format)
+        if: hashFiles('pyproject.toml', 'requirements.txt', 'setup.py', 'Pipfile') != ''
+        run: |
+          pip install --quiet ruff || { echo "::warning::ruff install failed, skipping auto-fix"; exit 0; }
+          ruff check . --fix || true
+          ruff format . || true
+
+      - name: Commit & push fixes
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No auto-fixes needed."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: auto-fix lint/format [skip ci]"
+          # Push back to the PR branch. [skip ci] in the message
+          # prevents an infinite loop of triggering this same workflow.
+          git push origin "HEAD:${GITHUB_HEAD_REF}"
+
   detect:
     name: Detect Project Type
     runs-on: ubuntu-latest
@@ -25,7 +126,15 @@ jobs:
       has_html: ${{ steps.detect.outputs.has_html }}
       has_markdown: ${{ steps.detect.outputs.has_markdown }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (PR branch tip, matches lint-and-test)
+        uses: actions/checkout@v4
+        with:
+          # Check out the same ref as `lint-and-test` so detection sees the
+          # exact tree that will be linted/tested. Otherwise on PRs, the
+          # default checkout uses a synthetic merge commit and could disagree
+          # with the PR branch tip (e.g. if auto-fix added/removed config
+          # files like package.json or tsconfig.json).
+          ref: ${{ github.head_ref || github.ref }}
 
       - name: Detect project type
         id: detect
@@ -48,10 +157,24 @@ jobs:
 
   lint-and-test:
     name: Lint, Test & Security
-    needs: detect
+    # Depend on auto-fix so we lint/test the healed code, but don't block
+    # when auto-fix is skipped (push events, forks, scheduled runs).
+    needs: [detect, auto-fix]
+    if: always() && needs.detect.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (latest, including any auto-fix commit)
+        uses: actions/checkout@v4
+        with:
+          # On PRs we deliberately check out the branch tip rather than the
+          # default synthetic merge commit, so we lint/test the same code the
+          # auto-fix job just pushed. Trade-off: merge-conflict-style issues
+          # against the base branch (e.g. duplicate symbols introduced by a
+          # concurrent merge to main) won't surface until after merge.
+          # Branch-protection "require branches to be up to date" mitigates
+          # this. Non-PR triggers fall back to `github.ref` so behavior is
+          # unchanged for push/schedule/dispatch.
+          ref: ${{ github.head_ref || github.ref }}
 
       # ── Node.js / TypeScript ──
       - name: Setup Node.js
@@ -60,43 +183,64 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Node dependencies
+      - name: Install Node dependencies (with retry)
         if: needs.detect.outputs.has_node == 'true'
         run: |
-          if [ -f "package-lock.json" ]; then npm ci;
-          elif [ -f "yarn.lock" ]; then yarn install --frozen-lockfile;
-          elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install --frozen-lockfile;
-          else npm install; fi
+          # Retry transient failures (registry hiccups, DNS, etc.) — a
+          # cheap form of self-healing for flaky network conditions.
+          install_cmd() {
+            if   [ -f "package-lock.json" ]; then npm ci
+            elif [ -f "yarn.lock" ];          then yarn install --frozen-lockfile
+            elif [ -f "pnpm-lock.yaml" ];     then npm i -g pnpm && pnpm install --frozen-lockfile
+            else                                   npm install
+            fi
+          }
+          n=0
+          until install_cmd; do
+            n=$((n+1))
+            if [ $n -ge 3 ]; then
+              echo "::error::npm install failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::install failed, retrying ($n/3)…"
+            sleep $((n*5))
+          done
 
       - name: Lint (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: |
-          if npm run lint --if-present 2>/dev/null; then
-            echo "Lint passed"
-          else
-            echo "::warning::Lint completed with issues"
-          fi
-        continue-on-error: true
+        run: npm run lint --if-present
 
       - name: Type Check
         if: needs.detect.outputs.has_typescript == 'true'
-        run: npx tsc --noEmit 2>/dev/null || echo "::warning::Type check completed with issues"
-        continue-on-error: true
+        run: npx --no-install tsc --noEmit
 
       - name: Test (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: npm test --if-present 2>/dev/null || echo "No tests configured"
-        continue-on-error: true
+        run: npm run test --if-present
 
-      - name: Security Audit (npm)
+      - name: Security Audit (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: npm audit --audit-level=high 2>/dev/null || echo "::warning::npm audit found vulnerabilities"
+        # Audits are advisory: transitive-dep vulnerabilities are commonly
+        # out of the project's direct control (waiting on upstream patches),
+        # so we surface findings as warnings instead of hard-failing CI.
+        # Promote to gating by removing `continue-on-error` once your
+        # dependency tree is clean.
         continue-on-error: true
+        run: |
+          # Use the package manager that matches the project's lockfile so
+          # the audit reflects the actual resolved dependency tree.
+          if [ -f "pnpm-lock.yaml" ]; then
+            npx --yes pnpm audit --audit-level=high
+          elif [ -f "yarn.lock" ]; then
+            # Yarn classic exits non-zero on any finding; gate on high severity.
+            yarn audit --level high
+          else
+            npm audit --audit-level=high
+          fi
 
       - name: Build
         if: needs.detect.outputs.has_node == 'true'
-        run: npm run build --if-present 2>/dev/null || echo "No build script"
-        continue-on-error: true
+        run: npm run build --if-present
 
       # ── Python ──
       - name: Setup Python
@@ -111,30 +255,51 @@ jobs:
           pip install --upgrade pip
           if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
           if [ -f "pyproject.toml" ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
-          pip install ruff pip-audit 2>/dev/null || true
+          # Fail loudly if the lint/audit tooling itself can't be installed —
+          # silently skipping would hide regressions in coverage.
+          pip install ruff pip-audit
 
       - name: Lint (ruff)
         if: needs.detect.outputs.has_python == 'true'
-        run: ruff check . 2>/dev/null || echo "::warning::Ruff found issues"
-        continue-on-error: true
+        run: ruff check .
 
       - name: Test (pytest)
         if: needs.detect.outputs.has_python == 'true'
-        run: python -m pytest --tb=short 2>/dev/null || echo "No tests configured"
-        continue-on-error: true
+        run: |
+          if ! python -c "import pytest" 2>/dev/null; then
+            echo "pytest not installed — skipping"
+            exit 0
+          fi
+          # Exit code 5 = "no tests collected", which we treat as success.
+          set +e
+          python -m pytest --tb=short
+          status=$?
+          set -e
+          if [ $status -eq 5 ]; then
+            echo "No tests configured"
+            exit 0
+          fi
+          exit $status
 
       - name: Security Audit (pip)
         if: needs.detect.outputs.has_python == 'true'
-        run: pip-audit 2>/dev/null || echo "::warning::pip-audit found vulnerabilities"
+        # Advisory for the same reason as the Node audit above. The missing-
+        # tool check still hard-fails because that indicates a pipeline
+        # regression, not a real-world dependency CVE.
         continue-on-error: true
+        run: |
+          if ! command -v pip-audit >/dev/null 2>&1; then
+            echo "::error::pip-audit is not installed — dependency install step likely failed"
+            exit 1
+          fi
+          pip-audit
 
       # ── HTML Validation ──
       - name: Validate HTML
         if: needs.detect.outputs.has_html == 'true'
         run: |
-          npm install -g htmlhint 2>/dev/null
-          htmlhint "**/*.html" --ignore "node_modules/**" 2>/dev/null || echo "::warning::HTML issues found"
-        continue-on-error: true
+          npm install -g htmlhint
+          htmlhint "**/*.html" --ignore "node_modules/**"
 
       # ── Markdown Link Check ──
       - name: Check Markdown Links
@@ -142,7 +307,6 @@ jobs:
         uses: gaurav-nelson/github-action-markdown-link-check@v1
         with:
           use-quiet-mode: 'yes'
-        continue-on-error: true
 
   security-scan:
     name: Security Scan
@@ -154,31 +318,60 @@ jobs:
           fetch-depth: 0
 
       - name: Scan for hardcoded secrets
+        # Deferred failure: record the result to a file and let the final
+        # gating step decide the job's exit. This way sensitive-file and
+        # license checks still run on the same CI round and developers see
+        # all violations at once instead of fixing them one-by-one.
         run: |
           echo "## Secret Scan Results" >> "$GITHUB_STEP_SUMMARY"
           FOUND=0
-          for pattern in "AKIA[0-9A-Z]{16}" "ghp_[a-zA-Z0-9]{36}" "sk-[a-zA-Z0-9]{48}" "-----BEGIN (RSA |EC |DSA )?PRIVATE KEY"; do
-            if git grep -rn -E "$pattern" -- ':!.github/' ':!*.yml' ':!*.yaml' 2>/dev/null; then
+          MATCHED_FILES=""
+          # Pattern coverage:
+          #   AKIA…           — AWS access key IDs
+          #   ghp_…           — GitHub classic personal access tokens
+          #   github_pat_…    — GitHub fine-grained personal access tokens
+          #   gho_/ghu_/ghs_/ghr_… — GitHub OAuth / user / server / refresh tokens
+          #   sk-proj-…       — OpenAI project-scoped keys (variable length)
+          #   sk-…            — OpenAI legacy keys
+          #   -----BEGIN … PRIVATE KEY — PEM-encoded private keys
+          for pattern in \
+            "AKIA[0-9A-Z]{16}" \
+            "ghp_[a-zA-Z0-9]{36}" \
+            "github_pat_[A-Za-z0-9_]{82}" \
+            "gh[ousr]_[A-Za-z0-9]{36,}" \
+            "sk-proj-[A-Za-z0-9_-]{20,}" \
+            "sk-[a-zA-Z0-9]{48}" \
+            "-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY"; do
+            # Use -l to print only file names — never print the matched line,
+            # which could itself contain the secret and leak it into public logs.
+            if files=$(git grep -l -E "$pattern" -- ':!.github/' ':!*.yml' ':!*.yaml' 2>/dev/null); then
               FOUND=1
+              MATCHED_FILES="${MATCHED_FILES}${files}"$'\n'
             fi
           done
           if [ "$FOUND" = "1" ]; then
             echo "::error::Potential secrets detected in repository"
-            echo "- :warning: Potential secrets found" >> "$GITHUB_STEP_SUMMARY"
+            echo "- :warning: Potential secrets found in:" >> "$GITHUB_STEP_SUMMARY"
+            # List file names only (never the matched content) in the summary.
+            printf '%s' "$MATCHED_FILES" | sort -u | sed '/^$/d; s/^/  - `/; s/$/`/' >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- :white_check_mark: No hardcoded secrets detected" >> "$GITHUB_STEP_SUMMARY"
           fi
-        continue-on-error: true
+          # Record (don't exit) — gating happens in the final step so the
+          # rest of the security checks still run on this CI round.
+          echo "$FOUND" > /tmp/secrets_found
 
       - name: Check for sensitive files
         run: |
           SENSITIVE_FILES=".env .env.local .env.production credentials.json service-account.json"
+          FOUND=0
           for f in $SENSITIVE_FILES; do
             if [ -f "$f" ]; then
-              echo "::warning::Sensitive file found: $f"
+              echo "::error::Sensitive file committed to repo: $f"
+              FOUND=1
             fi
           done
-        continue-on-error: true
+          echo "$FOUND" > /tmp/sensitive_found
 
       - name: License check
         run: |
@@ -188,6 +381,19 @@ jobs:
             echo "::notice::No LICENSE file found — consider adding one"
           fi
 
+      - name: Gate on security-scan results
+        # Final assertion: fail the job if any earlier check recorded a
+        # violation. Running last guarantees every check above produced
+        # output, so developers see every problem in a single run.
+        run: |
+          secrets=$(cat /tmp/secrets_found 2>/dev/null || echo 0)
+          sensitive=$(cat /tmp/sensitive_found 2>/dev/null || echo 0)
+          if [ "$secrets" != "0" ] || [ "$sensitive" != "0" ]; then
+            echo "::error::Security scan found violations (secrets=$secrets, sensitive_files=$sensitive)"
+            exit 1
+          fi
+          echo "All security checks passed."
+
   report:
     name: Pipeline Summary
     needs: [detect, lint-and-test, security-scan]
@@ -195,15 +401,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate summary
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          LINT_TEST_RESULT: ${{ needs.lint-and-test.result }}
+          SECURITY_RESULT: ${{ needs.security-scan.result }}
+          HAS_NODE: ${{ needs.detect.outputs.has_node || 'no' }}
+          HAS_TS: ${{ needs.detect.outputs.has_typescript || 'no' }}
+          HAS_PYTHON: ${{ needs.detect.outputs.has_python || 'no' }}
+          HAS_HTML: ${{ needs.detect.outputs.has_html || 'no' }}
+          HAS_MARKDOWN: ${{ needs.detect.outputs.has_markdown || 'no' }}
         run: |
-          echo "## CI/CD Pipeline Report" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Check | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Detection | ${{ needs.detect.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Lint & Test | ${{ needs.lint-and-test.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Security Scan | ${{ needs.security-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Detected:** Node=${{ needs.detect.outputs.has_node || 'no' }} | TS=${{ needs.detect.outputs.has_typescript || 'no' }} | Python=${{ needs.detect.outputs.has_python || 'no' }} | HTML=${{ needs.detect.outputs.has_html || 'no' }} | Markdown=${{ needs.detect.outputs.has_markdown || 'no' }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "_Ran at $(date -u '+%Y-%m-%d %H:%M UTC')_" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## CI/CD Pipeline Report"
+            echo ""
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+            echo "| Detection | ${DETECT_RESULT} |"
+            echo "| Lint & Test | ${LINT_TEST_RESULT} |"
+            echo "| Security Scan | ${SECURITY_RESULT} |"
+            echo ""
+            echo "**Detected:** Node=${HAS_NODE} | TS=${HAS_TS} | Python=${HAS_PYTHON} | HTML=${HAS_HTML} | Markdown=${HAS_MARKDOWN}"
+            echo ""
+            echo "_Ran at $(date -u '+%Y-%m-%d %H:%M UTC')_"
+          } >> "$GITHUB_STEP_SUMMARY"
