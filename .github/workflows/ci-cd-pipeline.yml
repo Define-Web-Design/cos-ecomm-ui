@@ -70,28 +70,19 @@ jobs:
 
       - name: Lint (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: |
-          if npm run lint --if-present 2>/dev/null; then
-            echo "Lint passed"
-          else
-            echo "::warning::Lint completed with issues"
-          fi
-        continue-on-error: true
+        run: npm run lint --if-present
 
       - name: Type Check
         if: needs.detect.outputs.has_typescript == 'true'
-        run: npx tsc --noEmit 2>/dev/null || echo "::warning::Type check completed with issues"
-        continue-on-error: true
+        run: npx tsc --noEmit
 
       - name: Test (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: npm test --if-present 2>/dev/null || echo "No tests configured"
-        continue-on-error: true
+        run: npm run test --if-present
 
       - name: Security Audit (npm)
         if: needs.detect.outputs.has_node == 'true'
-        run: npm audit --audit-level=high 2>/dev/null || echo "::warning::npm audit found vulnerabilities"
-        continue-on-error: true
+        run: npm audit --audit-level=high
 
       - name: Build
         if: needs.detect.outputs.has_node == 'true'
@@ -120,13 +111,25 @@ jobs:
 
       - name: Test (pytest)
         if: needs.detect.outputs.has_python == 'true'
-        run: python -m pytest --tb=short 2>/dev/null || echo "No tests configured"
-        continue-on-error: true
+        run: |
+          if ! python -c "import pytest" 2>/dev/null; then
+            echo "pytest not installed — skipping"
+            exit 0
+          fi
+          # Exit code 5 = "no tests collected", which we treat as success.
+          set +e
+          python -m pytest --tb=short
+          status=$?
+          set -e
+          if [ $status -eq 5 ]; then
+            echo "No tests configured"
+            exit 0
+          fi
+          exit $status
 
       - name: Security Audit (pip)
         if: needs.detect.outputs.has_python == 'true'
-        run: pip-audit 2>/dev/null || echo "::warning::pip-audit found vulnerabilities"
-        continue-on-error: true
+        run: pip-audit
 
       # ── HTML Validation ──
       - name: Validate HTML
@@ -157,18 +160,23 @@ jobs:
         run: |
           echo "## Secret Scan Results" >> "$GITHUB_STEP_SUMMARY"
           FOUND=0
+          MATCHED_FILES=""
           for pattern in "AKIA[0-9A-Z]{16}" "ghp_[a-zA-Z0-9]{36}" "sk-[a-zA-Z0-9]{48}" "-----BEGIN (RSA |EC |DSA )?PRIVATE KEY"; do
-            if git grep -rn -E "$pattern" -- ':!.github/' ':!*.yml' ':!*.yaml' 2>/dev/null; then
+            # Use -l to print only file names — never print the matched line,
+            # which could itself contain the secret and leak it into public logs.
+            if files=$(git grep -l -E "$pattern" -- ':!.github/' ':!*.yml' ':!*.yaml' 2>/dev/null); then
               FOUND=1
+              MATCHED_FILES="${MATCHED_FILES}${files}"$'\n'
             fi
           done
           if [ "$FOUND" = "1" ]; then
             echo "::error::Potential secrets detected in repository"
-            echo "- :warning: Potential secrets found" >> "$GITHUB_STEP_SUMMARY"
+            echo "- :warning: Potential secrets found in the following files:" >> "$GITHUB_STEP_SUMMARY"
+            echo "$MATCHED_FILES" | sort -u | sed '/^$/d; s/^/  - /' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           else
             echo "- :white_check_mark: No hardcoded secrets detected" >> "$GITHUB_STEP_SUMMARY"
           fi
-        continue-on-error: true
 
       - name: Check for sensitive files
         run: |
@@ -195,15 +203,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate summary
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          LINT_TEST_RESULT: ${{ needs.lint-and-test.result }}
+          SECURITY_RESULT: ${{ needs.security-scan.result }}
+          HAS_NODE: ${{ needs.detect.outputs.has_node || 'no' }}
+          HAS_TS: ${{ needs.detect.outputs.has_typescript || 'no' }}
+          HAS_PYTHON: ${{ needs.detect.outputs.has_python || 'no' }}
+          HAS_HTML: ${{ needs.detect.outputs.has_html || 'no' }}
+          HAS_MARKDOWN: ${{ needs.detect.outputs.has_markdown || 'no' }}
         run: |
-          echo "## CI/CD Pipeline Report" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Check | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Detection | ${{ needs.detect.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Lint & Test | ${{ needs.lint-and-test.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Security Scan | ${{ needs.security-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Detected:** Node=${{ needs.detect.outputs.has_node || 'no' }} | TS=${{ needs.detect.outputs.has_typescript || 'no' }} | Python=${{ needs.detect.outputs.has_python || 'no' }} | HTML=${{ needs.detect.outputs.has_html || 'no' }} | Markdown=${{ needs.detect.outputs.has_markdown || 'no' }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "_Ran at $(date -u '+%Y-%m-%d %H:%M UTC')_" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## CI/CD Pipeline Report"
+            echo ""
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+            echo "| Detection | ${DETECT_RESULT} |"
+            echo "| Lint & Test | ${LINT_TEST_RESULT} |"
+            echo "| Security Scan | ${SECURITY_RESULT} |"
+            echo ""
+            echo "**Detected:** Node=${HAS_NODE} | TS=${HAS_TS} | Python=${HAS_PYTHON} | HTML=${HAS_HTML} | Markdown=${HAS_MARKDOWN}"
+            echo ""
+            echo "_Ran at $(date -u '+%Y-%m-%d %H:%M UTC')_"
+          } >> "$GITHUB_STEP_SUMMARY"
