@@ -15,6 +15,104 @@ permissions:
   actions: read
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Self-healing auto-fix job.
+  #
+  # On pull requests from the same repository (forks can't get write
+  # tokens) this job runs the language's auto-fixers and pushes the
+  # resulting commit back to the PR branch BEFORE the gating
+  # lint-and-test job runs. That way, anything mechanically fixable
+  # (formatting, simple lint rules, import order) is healed in place
+  # instead of failing CI.
+  # ─────────────────────────────────────────────────────────────────────
+  auto-fix:
+    name: Auto-fix (self-heal)
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Node dependencies (with retry)
+        if: hashFiles('package.json') != ''
+        run: |
+          # Retry transient network failures up to 3 times.
+          install_cmd() {
+            if   [ -f "package-lock.json" ]; then npm ci
+            elif [ -f "yarn.lock" ];          then yarn install --frozen-lockfile
+            elif [ -f "pnpm-lock.yaml" ];     then npm i -g pnpm && pnpm install --frozen-lockfile
+            else                                   npm install
+            fi
+          }
+          n=0
+          until install_cmd; do
+            n=$((n+1))
+            if [ $n -ge 3 ]; then
+              echo "::error::npm install failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::install failed, retrying ($n/3)…"
+            sleep $((n*5))
+          done
+
+      - name: Auto-fix Node (eslint --fix, prettier --write)
+        if: hashFiles('package.json') != ''
+        run: |
+          # Best-effort: only run if the script/binary exists. Never fail
+          # the auto-fix job for missing tools — gating happens later.
+          if npm run | grep -qE '^\s*lint:fix'; then
+            npm run lint:fix || true
+          elif npx --no-install eslint --version >/dev/null 2>&1; then
+            npx --no-install eslint . --fix || true
+          fi
+          if npm run | grep -qE '^\s*format'; then
+            npm run format || true
+          elif npx --no-install prettier --version >/dev/null 2>&1; then
+            npx --no-install prettier --write . || true
+          fi
+
+      - name: Setup Python
+        if: hashFiles('pyproject.toml', 'requirements.txt', 'setup.py', 'Pipfile') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Auto-fix Python (ruff --fix, ruff format)
+        if: hashFiles('pyproject.toml', 'requirements.txt', 'setup.py', 'Pipfile') != ''
+        run: |
+          pip install --quiet ruff || { echo "::warning::ruff install failed, skipping auto-fix"; exit 0; }
+          ruff check . --fix || true
+          ruff format . || true
+
+      - name: Commit & push fixes
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No auto-fixes needed."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: auto-fix lint/format [skip ci]"
+          # Push back to the PR branch. [skip ci] in the message
+          # prevents an infinite loop of triggering this same workflow.
+          git push origin "HEAD:${GITHUB_HEAD_REF}"
+
   detect:
     name: Detect Project Type
     runs-on: ubuntu-latest
@@ -48,10 +146,16 @@ jobs:
 
   lint-and-test:
     name: Lint, Test & Security
-    needs: detect
+    # Depend on auto-fix so we lint/test the healed code, but don't block
+    # when auto-fix is skipped (push events, forks, scheduled runs).
+    needs: [detect, auto-fix]
+    if: always() && needs.detect.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (latest, including any auto-fix commit)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref }}
 
       # ── Node.js / TypeScript ──
       - name: Setup Node.js
@@ -60,43 +164,58 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Node dependencies
+      - name: Install Node dependencies (with retry)
         if: needs.detect.outputs.has_node == 'true'
         run: |
-          if [ -f "package-lock.json" ]; then npm ci;
-          elif [ -f "yarn.lock" ]; then yarn install --frozen-lockfile;
-          elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install --frozen-lockfile;
-          else npm install; fi
+          # Retry transient failures (registry hiccups, DNS, etc.) — a
+          # cheap form of self-healing for flaky network conditions.
+          install_cmd() {
+            if   [ -f "package-lock.json" ]; then npm ci
+            elif [ -f "yarn.lock" ];          then yarn install --frozen-lockfile
+            elif [ -f "pnpm-lock.yaml" ];     then npm i -g pnpm && pnpm install --frozen-lockfile
+            else                                   npm install
+            fi
+          }
+          n=0
+          until install_cmd; do
+            n=$((n+1))
+            if [ $n -ge 3 ]; then
+              echo "::error::npm install failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::install failed, retrying ($n/3)…"
+            sleep $((n*5))
+          done
 
       - name: Lint (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: |
-          if npm run lint --if-present 2>/dev/null; then
-            echo "Lint passed"
-          else
-            echo "::warning::Lint completed with issues"
-          fi
-        continue-on-error: true
+        run: npm run lint --if-present
 
       - name: Type Check
         if: needs.detect.outputs.has_typescript == 'true'
-        run: npx tsc --noEmit 2>/dev/null || echo "::warning::Type check completed with issues"
-        continue-on-error: true
+        run: npx --no-install tsc --noEmit
 
       - name: Test (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: npm test --if-present 2>/dev/null || echo "No tests configured"
-        continue-on-error: true
+        run: npm run test --if-present
 
-      - name: Security Audit (npm)
+      - name: Security Audit (Node)
         if: needs.detect.outputs.has_node == 'true'
-        run: npm audit --audit-level=high 2>/dev/null || echo "::warning::npm audit found vulnerabilities"
-        continue-on-error: true
+        run: |
+          # Use the package manager that matches the project's lockfile so
+          # the audit reflects the actual resolved dependency tree.
+          if [ -f "pnpm-lock.yaml" ]; then
+            npx --yes pnpm audit --audit-level=high
+          elif [ -f "yarn.lock" ]; then
+            # Yarn classic exits non-zero on any finding; gate on high severity.
+            yarn audit --level high
+          else
+            npm audit --audit-level=high
+          fi
 
       - name: Build
         if: needs.detect.outputs.has_node == 'true'
-        run: npm run build --if-present 2>/dev/null || echo "No build script"
-        continue-on-error: true
+        run: npm run build --if-present
 
       # ── Python ──
       - name: Setup Python
@@ -111,12 +230,13 @@ jobs:
           pip install --upgrade pip
           if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
           if [ -f "pyproject.toml" ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
-          pip install ruff pip-audit 2>/dev/null || true
+          # Fail loudly if the lint/audit tooling itself can't be installed —
+          # silently skipping would hide regressions in coverage.
+          pip install ruff pip-audit
 
       - name: Lint (ruff)
         if: needs.detect.outputs.has_python == 'true'
-        run: ruff check . 2>/dev/null || echo "::warning::Ruff found issues"
-        continue-on-error: true
+        run: ruff check .
 
       - name: Test (pytest)
         if: needs.detect.outputs.has_python == 'true'
@@ -138,15 +258,19 @@ jobs:
 
       - name: Security Audit (pip)
         if: needs.detect.outputs.has_python == 'true'
-        run: pip-audit
+        run: |
+          if ! command -v pip-audit >/dev/null 2>&1; then
+            echo "::error::pip-audit is not installed — dependency install step likely failed"
+            exit 1
+          fi
+          pip-audit
 
       # ── HTML Validation ──
       - name: Validate HTML
         if: needs.detect.outputs.has_html == 'true'
         run: |
-          npm install -g htmlhint 2>/dev/null
-          htmlhint "**/*.html" --ignore "node_modules/**" 2>/dev/null || echo "::warning::HTML issues found"
-        continue-on-error: true
+          npm install -g htmlhint
+          htmlhint "**/*.html" --ignore "node_modules/**"
 
       # ── Markdown Link Check ──
       - name: Check Markdown Links
@@ -154,7 +278,6 @@ jobs:
         uses: gaurav-nelson/github-action-markdown-link-check@v1
         with:
           use-quiet-mode: 'yes'
-        continue-on-error: true
 
   security-scan:
     name: Security Scan
@@ -170,7 +293,22 @@ jobs:
           echo "## Secret Scan Results" >> "$GITHUB_STEP_SUMMARY"
           FOUND=0
           MATCHED_FILES=""
-          for pattern in "AKIA[0-9A-Z]{16}" "ghp_[a-zA-Z0-9]{36}" "sk-[a-zA-Z0-9]{48}" "-----BEGIN (RSA |EC |DSA )?PRIVATE KEY"; do
+          # Pattern coverage:
+          #   AKIA…           — AWS access key IDs
+          #   ghp_…           — GitHub classic personal access tokens
+          #   github_pat_…    — GitHub fine-grained personal access tokens
+          #   gho_/ghu_/ghs_/ghr_… — GitHub OAuth / user / server / refresh tokens
+          #   sk-proj-…       — OpenAI project-scoped keys (variable length)
+          #   sk-…            — OpenAI legacy keys
+          #   -----BEGIN … PRIVATE KEY — PEM-encoded private keys
+          for pattern in \
+            "AKIA[0-9A-Z]{16}" \
+            "ghp_[a-zA-Z0-9]{36}" \
+            "github_pat_[A-Za-z0-9_]{82}" \
+            "gh[ousr]_[A-Za-z0-9]{36,}" \
+            "sk-proj-[A-Za-z0-9_-]{20,}" \
+            "sk-[a-zA-Z0-9]{48}" \
+            "-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY"; do
             # Use -l to print only file names — never print the matched line,
             # which could itself contain the secret and leak it into public logs.
             if files=$(git grep -l -E "$pattern" -- ':!.github/' ':!*.yml' ':!*.yaml' 2>/dev/null); then
@@ -186,17 +324,20 @@ jobs:
           else
             echo "- :white_check_mark: No hardcoded secrets detected" >> "$GITHUB_STEP_SUMMARY"
           fi
-        continue-on-error: true
+          # Fail the job if any secret pattern matched.
+          exit $FOUND
 
       - name: Check for sensitive files
         run: |
           SENSITIVE_FILES=".env .env.local .env.production credentials.json service-account.json"
+          FOUND=0
           for f in $SENSITIVE_FILES; do
             if [ -f "$f" ]; then
-              echo "::warning::Sensitive file found: $f"
+              echo "::error::Sensitive file committed to repo: $f"
+              FOUND=1
             fi
           done
-        continue-on-error: true
+          exit $FOUND
 
       - name: License check
         run: |
